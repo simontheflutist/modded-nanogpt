@@ -803,11 +803,48 @@ class DistAdam(torch.optim.Optimizer):
                 update = exp_avg.div(denom).mul_(step_size)
                 # weight decay
                 if wd != 0:
-                    mask = (update * p_slice) >= 0
-                    # lr as weight decay  schedule
                     eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
+                    # We implement a custom weight penalty based on the *squared induced infinity norm*:
+                    #     0.5 * ||A||_inf^2,  where ||A||_inf = max_i sum_j |A_ij|
+                    # Its (sub)gradient is nonzero only on a max row, and is scaled by ||A||_inf.
+                    #
+                    # Parameters are sharded across ranks by the leading dimension (rows):
+                    #   p_slice = param[rank * rank_size : (rank + 1) * rank_size]
+                    # so each rank can only see a contiguous block of rows.
+                    if p_slice.ndim == 0:
+                        # Scalar case: treat as standard L2 decay on a single value.
+                        p_slice.add_(p_slice, alpha=-eff_weight_decay)
+                    else:
+                        # Vector case: interpret each element as its own "row".
+                        # Matrix (or higher) case: treat the leading dimension as rows and
+                        # reduce everything else into the per-row 1-norm.
+                        if p_slice.ndim == 1:
+                            row_scores = p_slice.abs().float()
+                        else:
+                            row_scores = (
+                                p_slice.abs().float().flatten(start_dim=1).sum(dim=1)
+                            )
 
-                    update.addcmul_(p_slice, mask, value=eff_weight_decay * lr)
+                        local_argmax = row_scores.argmax()
+                        local_max = row_scores[local_argmax]
+
+                        # Compute the global induced infinity norm (max row 1-norm) across ranks.
+                        # This is an all-reduce MAX over the *local* maxima.
+                        # We assume the global max is achieved by a unique row, so exactly one rank
+                        # will satisfy local_max == global_max.
+                        global_max = local_max.clone()
+                        if self.world_size > 1:
+                            dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+
+                        if local_max == global_max:
+                            # Decay only the selected max row:
+                            #   row <- row - (lr * wd) * ||A||_inf * sign(row)
+                            # Other rows on this rank are unchanged.
+                            decay_scale = global_max.to(dtype=p_slice.dtype)
+                            p_slice[local_argmax].add_(
+                                p_slice[local_argmax].sign() * decay_scale,
+                                alpha=-eff_weight_decay,
+                            )
                 
                 p_slice.add_(other=update, alpha=-1.0)
 
