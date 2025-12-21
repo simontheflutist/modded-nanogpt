@@ -838,13 +838,13 @@ class DistAdam(torch.optim.Optimizer):
                         # Mask is 1.0 if this rank owns the global max and it's positive, else 0.0.
                         # On ties, multiple ranks may update (valid subgradient).
                         is_owner = (local_max >= global_max) & (global_max > 0)
-                        decay_scale = global_max.to(dtype=p_slice.dtype)
                         # Decay only the selected max row:
                         #   row <- row - (lr * wd) * ||A||_inf * sign(row)
-                        p_slice[local_argmax].add_(
-                            p_slice[local_argmax].sign() * decay_scale,
-                            alpha=-eff_weight_decay * is_owner,
-                        )
+                        # Clamp decay to element magnitudes to prevent sign flips (soft thresholding).
+                        max_row = p_slice[local_argmax]
+                        decay_amount = eff_weight_decay * global_max * is_owner
+                        clamped_decay = torch.minimum(decay_amount, max_row.abs())
+                        max_row.sub_(max_row.sign() * clamped_decay.to(dtype=max_row.dtype))
                 
                 p_slice.add_(other=update, alpha=-1.0)
 
