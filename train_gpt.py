@@ -812,7 +812,7 @@ class DistAdam(torch.optim.Optimizer):
                     #   p_slice = param[rank * rank_size : (rank + 1) * rank_size]
                     # so each rank can only see a contiguous block of rows.
                     if p_slice.ndim == 0:
-                        # Scalar case: treat as standard L2 decay on a single value.
+                        # Scalar case: gradient of 0.5*|p|^2 is |p|*sign(p) = p
                         p_slice.add_(p_slice, alpha=-eff_weight_decay)
                     else:
                         # Vector case: interpret each element as its own "row".
@@ -829,27 +829,22 @@ class DistAdam(torch.optim.Optimizer):
                         local_max = row_scores[local_argmax]
 
                         # Compute the global induced infinity norm (max row 1-norm) across ranks.
-                        # Gather all local maxima, then determine which rank owns the global max.
+                        # Use all_reduce MAX to find global_max, then check if this rank owns it.
+                        # Avoids .item() calls for torch.compile compatibility.
+                        global_max = local_max.clone()
                         if self.world_size > 1:
-                            all_local_maxes = torch.empty(
-                                self.world_size, device=p_slice.device, dtype=local_max.dtype
-                            )
-                            dist.all_gather_into_tensor(all_local_maxes, local_max.unsqueeze(0))
-                            owner_rank = int(all_local_maxes.argmax().item())
-                            global_max = all_local_maxes[owner_rank]
-                        else:
-                            owner_rank = 0
-                            global_max = local_max
+                            dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
 
-                        if rank == owner_rank and global_max > 0:
-                            # Decay only the selected max row:
-                            #   row <- row - (lr * wd) * ||A||_inf * sign(row)
-                            # Other rows on this rank are unchanged.
-                            decay_scale = global_max.to(dtype=p_slice.dtype)
-                            p_slice[local_argmax].add_(
-                                p_slice[local_argmax].sign() * decay_scale,
-                                alpha=-eff_weight_decay,
-                            )
+                        # Mask is 1.0 if this rank owns the global max and it's positive, else 0.0.
+                        # On ties, multiple ranks may update (valid subgradient).
+                        is_owner = (local_max >= global_max) & (global_max > 0)
+                        decay_scale = global_max.to(dtype=p_slice.dtype)
+                        # Decay only the selected max row:
+                        #   row <- row - (lr * wd) * ||A||_inf * sign(row)
+                        p_slice[local_argmax].add_(
+                            p_slice[local_argmax].sign() * decay_scale,
+                            alpha=-eff_weight_decay * is_owner,
+                        )
                 
                 p_slice.add_(other=update, alpha=-1.0)
 
