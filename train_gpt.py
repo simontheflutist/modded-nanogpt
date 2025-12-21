@@ -829,14 +829,19 @@ class DistAdam(torch.optim.Optimizer):
                         local_max = row_scores[local_argmax]
 
                         # Compute the global induced infinity norm (max row 1-norm) across ranks.
-                        # This is an all-reduce MAX over the *local* maxima.
-                        # We assume the global max is achieved by a unique row, so exactly one rank
-                        # will satisfy local_max == global_max.
-                        global_max = local_max.clone()
+                        # Gather all local maxima, then determine which rank owns the global max.
                         if self.world_size > 1:
-                            dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+                            all_local_maxes = torch.empty(
+                                self.world_size, device=p_slice.device, dtype=local_max.dtype
+                            )
+                            dist.all_gather_into_tensor(all_local_maxes, local_max.unsqueeze(0))
+                            owner_rank = int(all_local_maxes.argmax().item())
+                            global_max = all_local_maxes[owner_rank]
+                        else:
+                            owner_rank = 0
+                            global_max = local_max
 
-                        if local_max == global_max:
+                        if rank == owner_rank and global_max > 0:
                             # Decay only the selected max row:
                             #   row <- row - (lr * wd) * ||A||_inf * sign(row)
                             # Other rows on this rank are unchanged.
