@@ -424,33 +424,13 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 # -----------------------------------------------------------------------------
 # Compiled helpers for NorMuon by @chrisjmccormick
 
-@torch.compile(dynamic=False)
-def infinity_norm_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
-    """Infinity norm weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
-    
-    Decays only the row with maximum 1-norm, scaled by that norm (gradient of 0.5*||A||_inf^2).
-    Note: fullgraph=True not used due to data-dependent indexing for max row.
-    """
-    lr_factor = lr_tensor.to(p.dtype)
+@torch.compile(dynamic=False, fullgraph=True)
+def cautious_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
+    """Cautious weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors."""
+    mask = (v * p) >= 0
     wd_factor = wd_tensor.to(p.dtype)
-    
-    # Compute row 1-norms and find max row
-    if p.ndim < 2:
-        # Scalar/vector case: standard L2 decay
-        p.sub_(p * wd_factor)
-    else:
-        row_norms = p.abs().float().flatten(start_dim=1).sum(dim=1)
-        max_idx = row_norms.argmax()
-        global_max = row_norms[max_idx]
-        
-        if global_max > 0:
-            # Decay max row: row <- row - wd * ||A||_inf * sign(row)
-            max_row = p[max_idx]
-            decay_scale = (wd_factor * global_max).to(dtype=max_row.dtype)
-            max_row.sub_(max_row.sign() * decay_scale)
-    
-    # Apply gradient update
-    p.sub_(v * lr_factor)
+    lr_factor = lr_tensor.to(p.dtype)
+    p.copy_(p - (p * mask * wd_factor * lr_factor) - (v * lr_factor))
     
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -683,14 +663,14 @@ class NorMuon(torch.optim.Optimizer):
 
             v_chunk = v_chunk.view(grad_shape)
        
-            # Infinity norm weight decay (gradient of 0.5*||A||_inf^2)
+            # # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
             updated_params = torch.empty_like(grad_chunk)
             if num_params > 0:
                 # Work on a stacked copy to avoid touching original params
                 param_chunk = torch.stack(params[module_idx:module_idx + num_params])
 
                 for local_idx in range(num_params):
-                    infinity_norm_wd_and_update_inplace(
+                    cautious_wd_and_update_inplace(
                         param_chunk[local_idx],
                         v_chunk[local_idx],
                         eff_wd_cpu[local_idx],
@@ -858,11 +838,13 @@ class DistAdam(torch.optim.Optimizer):
                         # Mask is 1.0 if this rank owns the global max and it's positive, else 0.0.
                         # On ties, multiple ranks may update (valid subgradient).
                         is_owner = (local_max >= global_max) & (global_max > 0)
+                        decay_scale = global_max.to(dtype=p_slice.dtype)
                         # Decay only the selected max row:
                         #   row <- row - (lr * wd) * ||A||_inf * sign(row)
-                        max_row = p_slice[local_argmax]
-                        decay_scale = (eff_weight_decay * global_max * is_owner).to(dtype=max_row.dtype)
-                        max_row.sub_(max_row.sign() * decay_scale)
+                        p_slice[local_argmax].add_(
+                            p_slice[local_argmax].sign() * decay_scale,
+                            alpha=-eff_weight_decay * is_owner,
+                        )
                 
                 p_slice.add_(other=update, alpha=-1.0)
 
@@ -1470,7 +1452,7 @@ optimizer1 = DistAdam(
     lr=0.008,
     betas=(0.65, 0.95),
     eps=1e-8,
-    weight_decay=0.003,
+    weight_decay=0.005,
 )
 optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
