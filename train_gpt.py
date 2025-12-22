@@ -1127,7 +1127,7 @@ class GPT(nn.Module):
         
         self.scalars.label = 'scalars'
         # Lipschitz regularization coefficient (0 = disabled)
-        self.lipschitz_lambda = 1e-4
+        self.lipschitz_lambda = 1e-3
         # set learning rates
         for param in self.embed.parameters():
             param.lr_mul = 75.
