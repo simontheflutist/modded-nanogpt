@@ -428,7 +428,7 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 def infinity_norm_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
     """Infinity norm weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
     
-    Decays only the row with maximum 1-norm, scaled by that norm (gradient of 0.5*||A||_inf^2).
+    Decays only the row with maximum 1-norm (gradient of log ||A||_inf).
     Note: fullgraph=True not used due to data-dependent indexing for max row.
     """
     lr_factor = lr_tensor.to(p.dtype)
@@ -436,17 +436,17 @@ def infinity_norm_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
     
     # Compute row 1-norms and find max row
     if p.ndim < 2:
-        # Scalar/vector case: standard L2 decay
-        p.sub_(p * wd_factor)
+        # Scalar/vector case: gradient of log|p| is sign(p)/|p|
+        p.sub_(p.sign() / p.abs().clamp(min=1e-8) * wd_factor)
     else:
         row_norms = p.abs().float().flatten(start_dim=1).sum(dim=1)
         max_idx = row_norms.argmax()
         global_max = row_norms[max_idx]
         
         if global_max > 0:
-            # Decay max row: row <- row - wd * ||A||_inf * sign(row)
+            # Decay max row: row <- row - wd * sign(row) / ||A||_inf
             max_row = p[max_idx]
-            decay_scale = (wd_factor * global_max).to(dtype=max_row.dtype)
+            decay_scale = (wd_factor / global_max).to(dtype=max_row.dtype)
             max_row.sub_(max_row.sign() * decay_scale)
     
     # Apply gradient update
@@ -858,10 +858,10 @@ class DistAdam(torch.optim.Optimizer):
                         # Mask is 1.0 if this rank owns the global max and it's positive, else 0.0.
                         # On ties, multiple ranks may update (valid subgradient).
                         is_owner = (local_max >= global_max) & (global_max > 0)
-                        # Decay only the selected max row:
-                        #   row <- row - (lr * wd) * ||A||_inf * sign(row)
+                        # Decay only the selected max row (gradient of log ||A||_inf):
+                        #   row <- row - (lr * wd) * sign(row) / ||A||_inf
                         max_row = p_slice[local_argmax]
-                        decay_scale = (eff_weight_decay * global_max * is_owner).to(dtype=max_row.dtype)
+                        decay_scale = (eff_weight_decay * is_owner / global_max.clamp(min=1e-8)).to(dtype=max_row.dtype)
                         max_row.sub_(max_row.sign() * decay_scale)
                 
                 p_slice.add_(other=update, alpha=-1.0)
@@ -1465,14 +1465,15 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+single_weight_decay = 1e-3
 optimizer1 = DistAdam(
     embed_params + scalar_params + head_params,
     lr=0.008,
     betas=(0.65, 0.95),
     eps=1e-8,
-    weight_decay=0.003,
+    weight_decay=single_weight_decay,
 )
-optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=1.2 * 0.1)
+optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=single_weight_decay)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
