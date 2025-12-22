@@ -1477,7 +1477,7 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-single_weight_decay = 2e-3
+single_weight_decay = 1e-2
 optimizer1 = DistAdam(
     embed_params + scalar_params + head_params,
     lr=0.008,
