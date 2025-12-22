@@ -424,30 +424,41 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 # -----------------------------------------------------------------------------
 # Compiled helpers for NorMuon by @chrisjmccormick
 
+def _apply_log_infinity_norm_decay(p, wd_factor):
+    """Apply log infinity norm decay to a single 2D matrix."""
+    row_norms = p.abs().float().flatten(start_dim=1).sum(dim=1)
+    max_idx = row_norms.argmax()
+    global_max = row_norms[max_idx]
+    
+    if global_max > 0:
+        # Decay max row: row <- row - wd * sign(row) / ||A||_inf
+        max_row = p[max_idx]
+        decay_scale = (wd_factor / global_max).to(dtype=max_row.dtype)
+        max_row.sub_(max_row.sign() * decay_scale)
+
+
 @torch.compile(dynamic=False)
-def infinity_norm_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
+def infinity_norm_wd_and_update_inplace(p, v, wd_tensor, lr_tensor, is_attn: bool = False):
     """Infinity norm weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
     
     Decays only the row with maximum 1-norm (gradient of log ||A||_inf).
+    For attention (is_attn=True), splits QKVO into 4 matrices and decays each separately.
     Note: fullgraph=True not used due to data-dependent indexing for max row.
     """
     lr_factor = lr_tensor.to(p.dtype)
     wd_factor = wd_tensor.to(p.dtype)
     
-    # Compute row 1-norms and find max row
     if p.ndim < 2:
         # Scalar/vector case: gradient of log|p| is sign(p)/|p|
         p.sub_(p.sign() / p.abs().clamp(min=1e-8) * wd_factor)
+    elif is_attn:
+        # Attention: split into Q, K, V, O and decay each separately
+        # Shape is (4*dim, hdim), split into 4 matrices of (dim, hdim)
+        chunk_size = p.shape[0] // 4
+        for i in range(4):
+            _apply_log_infinity_norm_decay(p[i*chunk_size:(i+1)*chunk_size], wd_factor)
     else:
-        row_norms = p.abs().float().flatten(start_dim=1).sum(dim=1)
-        max_idx = row_norms.argmax()
-        global_max = row_norms[max_idx]
-        
-        if global_max > 0:
-            # Decay max row: row <- row - wd * sign(row) / ||A||_inf
-            max_row = p[max_idx]
-            decay_scale = (wd_factor / global_max).to(dtype=max_row.dtype)
-            max_row.sub_(max_row.sign() * decay_scale)
+        _apply_log_infinity_norm_decay(p, wd_factor)
     
     # Apply gradient update
     p.sub_(v * lr_factor)
@@ -695,6 +706,7 @@ class NorMuon(torch.optim.Optimizer):
                         v_chunk[local_idx],
                         eff_wd_cpu[local_idx],
                         eff_lr_cpu[local_idx],
+                        is_attn=(ref_param.label == 'attn'),
                     )
             else:
                 param_chunk = torch.zeros_like(v_chunk)
