@@ -424,12 +424,12 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
 # -----------------------------------------------------------------------------
 # Compiled helpers for NorMuon by @chrisjmccormick
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(dynamic=False)
 def infinity_norm_wd_and_update_inplace(p, v, wd_tensor, lr_tensor):
     """Infinity norm weight decay + parameter update. wd_tensor and lr_tensor are 0-D CPU tensors.
     
     Decays only the row with maximum 1-norm, scaled by that norm (gradient of 0.5*||A||_inf^2).
-    Uses soft thresholding to prevent sign flips.
+    Note: fullgraph=True not used due to data-dependent indexing for max row.
     """
     lr_factor = lr_tensor.to(p.dtype)
     wd_factor = wd_tensor.to(p.dtype)
