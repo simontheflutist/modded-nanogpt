@@ -889,6 +889,19 @@ class DistAdam(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
+def log_inf_norm(W: Tensor) -> Tensor:
+    """Log of induced infinity norm: log(max_i sum_j |W_ij|).
+    For Lipschitz bound on linear layer y = Wx in infinity norm."""
+    if W.ndim == 1:
+        return W.abs().sum().log()
+    return W.abs().sum(dim=-1).max().log()
+
+def log_inf_norm_T(W: Tensor) -> Tensor:
+    """Log of induced infinity norm of W^T: log(max_j sum_i |W_ij|)."""
+    if W.ndim == 1:
+        return W.abs().sum().log()
+    return W.abs().sum(dim=-2).max().log()
+
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
@@ -1113,6 +1126,8 @@ class GPT(nn.Module):
         )
         
         self.scalars.label = 'scalars'
+        # Lipschitz regularization coefficient (0 = disabled)
+        self.lipschitz_lambda = 1e-3
         # set learning rates
         for param in self.embed.parameters():
             param.lr_mul = 75.
@@ -1121,6 +1136,86 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
         self.scalars.wd_mul = 0.0
+
+    def log_lipschitz_bound(self) -> Tensor:
+        """Compute log of upper bound on infinity-norm Lipschitz constant.
+        
+        Uses product of induced infinity norms, converted to sum of logs.
+        Correctly handles residual connections: Lip(x + f(x)) = 1 + Lip(f).
+        
+        Treats ReLU^2 as 1-Lipschitz (as requested).
+        """
+        d = self.embed.weight.size(1)  # model_dim
+        sqrt_d = math.sqrt(d)
+        log_lip = torch.zeros(1, device=self.embed.weight.device, dtype=torch.float32)
+        
+        # Initial norm: sqrt(d) bound
+        log_lip = log_lip + 0.5 * math.log(d)
+        
+        # Residual lambdas contribute multiplicatively per layer
+        resid_lambdas = self.scalars[: self.num_layers]
+        x0_lambdas = self.scalars[self.num_layers: 2 * self.num_layers]
+        sa_lambdas = self.scalars[2 * self.num_layers: 4 * self.num_layers].view(-1, 2)
+        skip_lambda = self.scalars[4 * self.num_layers + 2]
+        
+        for i, block in enumerate(self.blocks):
+            # Lambda scaling happens BEFORE block: x_scaled = λ_resid * x + λ_x0 * x0
+            # Worst case Lipschitz w.r.t. x: |λ_resid| (x0 term doesn't depend on x)
+            # For layer 0, x = x0, so it's |λ_resid + λ_x0|
+            if i == 0:
+                lambda_scale = (resid_lambdas[i] + x0_lambdas[i]).abs()
+            else:
+                lambda_scale = resid_lambdas[i].abs()
+            log_lip = log_lip + lambda_scale.clamp(min=1e-8).log()
+            
+            # Block has residual structure: x = x + attn(norm(x)), x = x + mlp(norm(x))
+            # Lip(x + f(norm(x))) = 1 + Lip(f) * Lip(norm) = 1 + L_f * sqrt(d)
+            
+            # Attention block (if present): L_attn_branch = 1 + L_attn * sqrt(d)
+            if block.attn is not None:
+                qkvo_w = block.attn.qkvo_w
+                dim = block.attn.dim
+                head_dim = block.attn.head_dim
+                
+                # L_attn = ||W_Q|| * ||W_K|| * d_h * ||W_V|| * ||W_O|| * |sa_λ|^2 * (1/4) * ||W_gate||
+                # (QK norm contributes sqrt(d_h) each, softmax Lip=1, gate sigmoid Lip=1/4)
+                L_attn = (
+                    log_inf_norm(qkvo_w[:dim]).exp() *        # Q
+                    log_inf_norm(qkvo_w[dim:2*dim]).exp() *   # K
+                    head_dim *                                 # sqrt(d_h)^2 from QK norms
+                    log_inf_norm(qkvo_w[2*dim:3*dim]).exp() * # V
+                    log_inf_norm(qkvo_w[3*dim:]).exp() *      # O
+                    sa_lambdas[i].abs().clamp(min=1e-8).prod() *  # SA lambdas
+                    0.25 *                                     # sigmoid Lip
+                    log_inf_norm(block.attn.attn_gate.weight).exp()  # gate weight
+                )
+                # Residual: Lip = 1 + L_attn * sqrt(d)
+                log_lip = log_lip + (1.0 + L_attn * sqrt_d).log()
+            
+            # MLP block: L_mlp_branch = 1 + L_mlp * sqrt(d)
+            if block.mlp is not None:
+                # L_mlp = ||W_fc|| * ||W_proj^T||  (ReLU^2 treated as Lip=1)
+                L_mlp = (
+                    log_inf_norm(block.mlp.c_fc).exp() *
+                    log_inf_norm_T(block.mlp.c_proj).exp()
+                )
+                # Residual: Lip = 1 + L_mlp * sqrt(d)
+                log_lip = log_lip + (1.0 + L_mlp * sqrt_d).log()
+        
+        # Skip connection (layer 3 -> 6): x = x + gate * skip
+        # Contributes factor (1 + sigmoid(skip_lambda))
+        skip_factor = 1.0 + torch.sigmoid(skip_lambda)
+        log_lip = log_lip + skip_factor.log()
+        
+        # Final norm: sqrt(d)
+        log_lip = log_lip + 0.5 * math.log(d)
+        
+        # lm_head
+        log_lip = log_lip + log_inf_norm(self.lm_head.weight)
+        
+        # Softcapping 30*sigmoid(x/7.5): Lip = 30 * 1/4 * 1/7.5 = 1, so +0
+        
+        return log_lip
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
@@ -1196,6 +1291,12 @@ class GPT(nn.Module):
             target_seq,
             reduction="sum" if self.training else "mean",
         )
+        
+        # Add Lipschitz regularization if enabled
+        if self.training and self.lipschitz_lambda > 0:
+            log_lip = self.log_lipschitz_bound()
+            loss = loss + self.lipschitz_lambda * log_lip.squeeze()
+        
         return loss
 
 # -----------------------------------------------------------------------------
@@ -1477,7 +1578,7 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-single_weight_decay = 1e-2
+single_weight_decay = 0
 optimizer1 = DistAdam(
     embed_params + scalar_params + head_params,
     lr=0.008,
