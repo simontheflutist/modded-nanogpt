@@ -1478,14 +1478,15 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 single_weight_decay = 1e0
+lr_scale = 1.1
 optimizer1 = DistAdam(
     embed_params + scalar_params + head_params,
-    lr=0.008,
+    lr=0.008 * lr_scale,
     betas=(0.65, 0.95),
     eps=1e-8,
     weight_decay=single_weight_decay,
 )
-optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.023, momentum=0.95, beta2=0.95, weight_decay=single_weight_decay)
+optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.023 * lr_scale, momentum=0.95, beta2=0.95, weight_decay=single_weight_decay)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
