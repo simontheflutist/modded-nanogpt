@@ -35,10 +35,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
-# Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
-# https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+from triton_kernels import XXT, XTX, ba_plus_cAA, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
 
 dynamo.config.recompile_limit = 64
 
@@ -1234,12 +1231,17 @@ class GPT(nn.Module):
         self.mlp_bank = nn.Parameter(torch.empty(12, 2, mlp_hdim, model_dim))  # (12, 2, 3072, 768)
         self.mlp_bank.reshape = (24, mlp_hdim, model_dim)  # Shape for sharding: (24, 3072, 768)
 
-        # improved init scale by @YouJiacheng and @srashedll
+        # Uniform-phase initialization for sine hidden layers (stable-initialization paper, Definition 1):
+        # W_ij ~ N(0, std), b_i ~ U(0, 2pi)
         std = 0.5 * model_dim ** -0.5
-        bound = (3 ** 0.5) * std
+        # simon kuang: scale up for sine?
+        std *= 2**0.5
         with torch.no_grad():
-            self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
+            nn.init.normal_(self.mlp_bank[:, 0, :, :], mean=0, std=std)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
+        self.mlp_fc_bias = nn.Parameter(torch.empty(12, mlp_hdim))
+        with torch.no_grad():
+            self.mlp_fc_bias.uniform_(0, 2 * math.pi)
 
     def init_misc(self, model_dim, num_layers):
         self.smear_gate = nn.Linear(12, 1, bias=False)
@@ -1329,19 +1331,6 @@ class GPT(nn.Module):
         x = (F.linear(x, self.mudd_w2[id, :num_coef]) + self.mudd_b2[id, :num_coef]) * self._mudd_scale
         return x.split(1, dim=-1)
 
-    def quantize_mlp_fp8(self):
-        """Refresh the FP8 copy of the MLP up-projection weights after optimizer steps."""
-        E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-        with torch.no_grad():
-            if not hasattr(self, "_mlp_up_proj_f8"):
-                self._mlp_up_proj_f8 = torch.zeros_like(self.mlp_bank[:, 0], dtype=torch.float8_e4m3fn)
-                self._mlp_up_proj_scales = torch.ones(12, dtype=torch.float32, device=self.mlp_bank.device)
-                self._mlp_dequant_scale_buf = torch.ones(1, dtype=torch.float32, device=self.mlp_bank.device)
-            flat = self.mlp_bank[:, 0].view(12, -1)
-            scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
-            self._mlp_up_proj_scales[:] = scales.float()
-            self._mlp_up_proj_f8[:] = (model.mlp_bank[:, 0] / scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
-
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
@@ -1353,17 +1342,11 @@ class GPT(nn.Module):
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
 
-        use_mlp_fp8 = self.training and not os.environ.get("DISABLE_FP8", False)
-        if use_mlp_fp8:
-            mlp_up_proj_f8 = self._mlp_up_proj_f8.unbind(0)
-            mlp_up_proj_scales = [self._mlp_up_proj_scales[i:i+1] for i in range(12)]
-
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
         smear_lambda = self.scalars[2 * self.num_layers]
         skip_lambda = self.scalars[2 * self.num_layers + 1]
         resid_lambdas_attn = self.resid_lambdas[:, 0].bfloat16().unbind(0)
-        resid_lambdas_mlp  = self.resid_lambdas[:, 1].bfloat16().unbind(0)
         post_lambdas_attn = self.post_lambdas[:, 0].bfloat16().unbind(0)
         post_lambdas_mlp  = self.post_lambdas[:, 1].bfloat16().unbind(0)
         x0_lambdas = self.x0_lambdas.bfloat16().unbind(0)
@@ -1383,6 +1366,7 @@ class GPT(nn.Module):
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+        mlp_fc_biases = self.mlp_fc_bias.unbind(0)  # 12 tensors of [mlp_hdim]
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -1423,8 +1407,7 @@ class GPT(nn.Module):
             attn = self.attn_paired if is_paired else self.attn
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
-            if use_mlp_fp8:
-                up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
+            b_fc = mlp_fc_biases[i]
             mu = None
 
             # process attn. skip on layer 6 @YouJiacheng
@@ -1475,20 +1458,15 @@ class GPT(nn.Module):
                     if bg_inject[i] is not None:
                         x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + bg_inject[i]
 
-            # process mlp
+            # process mlp: sin(W @ norm(x) + b) @ c_proj (no residual connection)
             normed = norm(x)
-            if use_mlp_fp8:
-                amax = normed.detach().abs().max().clamp(min=1e-12)
-                x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
-                self._mlp_dequant_scale_buf.copy_(up_proj_scale).mul_(amax).div_(448.0)
-                mlp_args = (c_fc, c_proj, up_proj_f8, self._mlp_dequant_scale_buf, x_f8)
-            else:
-                mlp_args = (c_fc, c_proj)
+            h = torch.sin(F.linear(normed, c_fc, bias=b_fc))
+            mlp_out = F.linear(h, c_proj)
 
             if mu is not None:
-                x = mu[12] * x + mu[13] * ReLUSqrdMLP(normed, *mlp_args)
+                x = mu[13] * mlp_out
             else:
-                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
+                x = post_lambdas_mlp[i] * mlp_out
 
             if i in self.cache_layers:
                 cache[i] = x
@@ -1840,6 +1818,7 @@ class TrainingManager():
             "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "mlp_fc_bias":    {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1867,7 +1846,7 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "mudd_b2", "xsa_alphas",
-            "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas", "mlp_fc_bias",  # Small, fast
         ] + [
             "mudd_w2",
             "value_embeds", "bigram_embed",  # Medium
@@ -2059,13 +2038,13 @@ model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+model.mlp_fc_bias.data = model.mlp_fc_bias.data.bfloat16()
 model.mudd_w1.data = model.mudd_w1.data.bfloat16()
 model.mudd_w2.data = model.mudd_w2.data.bfloat16()
 model.mudd_b2.data = model.mudd_b2.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
-model.quantize_mlp_fp8()
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
@@ -2101,13 +2080,11 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
-    model.quantize_mlp_fp8()
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
-model.quantize_mlp_fp8()
 model.train()
 
 ########################################
@@ -2168,7 +2145,6 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
-    model.quantize_mlp_fp8()
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
